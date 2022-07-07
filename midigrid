@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+import sys
+import time
+import signal
+from dataclasses import dataclass
+
+from luma.core.interface.serial import i2c
+from luma.core.render import canvas
+from luma.oled.device import ssd1306
+from alsa_midi import SequencerClient, SubscriptionQueryType, EventType, PortType, PortCaps, SYSTEM_ANNOUNCE
+
+# OLED
+serial = i2c(port=1, address=0x3C)
+device = ssd1306(serial)
+device.contrast(128)
+
+# ALSA MIDI
+seq = SequencerClient("MIDI Monitor")
+port = seq.create_port("OLED", PortCaps.WRITE | PortCaps.NO_EXPORT, type=PortType.APPLICATION)
+port.connect_from(SYSTEM_ANNOUNCE)
+
+# GRID
+ROWS = COLS = 4
+SIDE_LENGTH = 12
+
+
+@dataclass
+class Jack:
+    row: int
+    col: int
+    port_out: str
+    port_in: str
+    connected: bool
+
+    def __str__(self):
+        return f"{self.row}:{self.col} ({self.connected})"
+
+
+class Grid:
+    def __init__(self, draw=None, rows=4, cols=4, x=0, y=0, side_length=10):
+        """
+        Arguments:
+            draw: PIL.ImageDraw
+            rows: row count
+            cols: col count
+            x: offset x
+            y: offset y
+            side_length: side length
+        """
+        assert draw is not None
+        self.draw = draw
+        self.rows = rows
+        self.cols = cols
+        self._x = x
+        self._y = y
+        self.side_length = side_length
+
+    def align_right(self):
+        self._x = device.width - self.width - 2
+
+    def rx(self, x):
+        return self._x + x * self.side_length
+
+    def ry(self, y):
+        return self._y + y * self.side_length
+
+    @property
+    def height(self):
+        return self.rows * self.side_length
+
+    @property
+    def width(self):
+        return self.cols * self.side_length
+
+    def generate_unit_squares(self, width, height):
+        """Generate coordinates for a tiling of unit squares."""
+        for x in range(width):
+            for y in range(height):
+                yield [(x, y), (x + 1, y), (x + 1, y + 1), (x, y + 1)]
+
+    def generate_squares(self):
+        """Generate coordinates for a tiling of squares."""
+        for coords in self.generate_unit_squares(self.rows, self.cols):
+            yield [(self.rx(x), self.ry(y)) for (x, y) in coords]
+
+    def display(self):
+        for coords in self.generate_squares():
+            self.draw.polygon(coords, outline="white")
+
+    def mark(self, x, y):
+        self.draw.text((self.rx(x) + 4, self.ry(y)), "X", fill="white")
+
+
+def get_midi_connections():
+    ports = seq.list_ports(output=True, type=PortType.MIDI_GENERIC | PortType.HARDWARE)
+
+    labels = [port.client_name for port in ports]
+    matrix = []
+
+    for row, outport in enumerate(ports):
+        # Find inputs connected to the outport
+        subscribers = [
+            subscriber.addr.client_id
+            for subscriber in seq.list_port_subscribers(outport, type=SubscriptionQueryType.WRITE)
+        ]
+
+        # Add jacks
+        matrix.append(
+            [
+                Jack(row, col, outport.client_name, port.client_name, port.client_id in subscribers)
+                for col, port in enumerate(ports)
+            ]
+        )
+
+    return labels, matrix
+
+
+def display():
+    """Get and display all MIDI connections"""
+
+    with canvas(device) as draw:
+        grid = Grid(draw=draw, rows=ROWS, cols=COLS, y=8, side_length=SIDE_LENGTH)
+        grid.align_right()
+        grid.display()
+
+        labels, matrix = get_midi_connections()
+
+        for idx, label in enumerate(labels):
+            draw.text((0, grid.ry(idx)), label[:12], fill="white", anchor="ar")
+
+        for jacks in matrix:
+            for jack in jacks:
+                if jack.connected:
+                    grid.mark(jack.row, jack.col)
+
+
+def main():
+    display()
+
+    while True:
+        event = seq.event_input()
+
+        if event.type not in (
+            EventType.PORT_START,
+            EventType.PORT_EXIT,
+            EventType.PORT_SUBSCRIBED,
+            EventType.PORT_UNSUBSCRIBED,
+        ):
+            continue
+
+        display()
+
+
+def shutdown(*args, **kwargs):
+    print("shutting down!")
+    device.cleanup()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, shutdown)
+    main()

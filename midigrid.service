@@ -1,0 +1,9 @@
+[Unit]
+Description=ALSA MIDI grid oled monitor
+After=sound.target
+
+[Service]
+ExecStart=/usr/bin/midigrid
+
+[Install]
+WantedBy=multi-user.target
