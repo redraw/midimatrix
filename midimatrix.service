@@ -3,7 +3,7 @@ Description=ALSA MIDI grid oled monitor
 After=sound.target
 
 [Service]
-ExecStart=/usr/bin/midigrid
+ExecStart=/usr/bin/midimatrix
 
 [Install]
 WantedBy=multi-user.target

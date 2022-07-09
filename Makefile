@@ -1,4 +1,4 @@
-NAME = midigrid
+NAME = midimatrix
 
 sync:
 	rsync -av . pi@raspberry.local:~/$(NAME)

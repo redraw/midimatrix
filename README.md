@@ -1,6 +1,6 @@
-# midigrid
+# midimatrix
 
-![midigrid](https://user-images.githubusercontent.com/10843208/177895595-ab3cdf49-fa71-45f3-93fc-83accc53fa9d.png)
+![midimatrix](https://user-images.githubusercontent.com/10843208/177895595-ab3cdf49-fa71-45f3-93fc-83accc53fa9d.png)
 
 This tool for Raspberry Pi monitors MIDI connections, and displays them in a OLED screen.
 
@@ -25,7 +25,7 @@ Go to `Interface Options` -> `I2C`, and turn on. Then connect your OLED screen u
 If your I2C address is different from `0x3C`, run
 
 ```
-sudo systemctl edit midigrid
+sudo systemctl edit midimatrix
 ```
 and it will open an editor, add this,
 
@@ -37,7 +37,7 @@ save, and restart the service
 
 ```
 sudo systemctl daemon-reload
-sudo systemctl restart midigrid
+sudo systemctl restart midimatrix
 ```
 
 ## Connect MIDI devices
