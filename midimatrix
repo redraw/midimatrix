@@ -1,64 +1,201 @@
 #!/usr/bin/env python3
-import os
-import sys
-import time
-import signal
-from dataclasses import dataclass
+import argparse
+import threading
+from dataclasses import dataclass, field
+from typing import Protocol
 
+from PIL import ImageDraw
 from luma.core.interface.serial import i2c
 from luma.core.render import canvas
 from luma.oled.device import ssd1306
-from alsa_midi import SequencerClient, SubscriptionQueryType, EventType, PortType, PortCaps, SYSTEM_ANNOUNCE
-
-# GRID
-ROWS = COLS = 4
-SIDE_LENGTH = 12
-
-# OLED
-OLED_I2C_ADDRESS = os.getenv("OLED_I2C_ADDRESS", "0x3C")
-serial = i2c(port=1, address=int(OLED_I2C_ADDRESS, 16))
-device = ssd1306(serial)
-device.contrast(128)
+from alsa_midi import SequencerClient, SubscriptionQueryType, EventType, PortInfo, PortType, PortCaps, SYSTEM_ANNOUNCE
+from gpiozero import Button
 
 # ALSA MIDI
 seq = SequencerClient("MIDI Monitor")
 port = seq.create_port("OLED", PortCaps.WRITE | PortCaps.NO_EXPORT, type=PortType.APPLICATION)
 port.connect_from(SYSTEM_ANNOUNCE)
 
+MAX_USB_PORTS = 4
+
 
 @dataclass
 class Jack:
     row: int
     col: int
-    port_out: str
-    port_in: str
+    port_out: PortInfo
+    port_in: PortInfo
     connected: bool
 
-    def __str__(self):
-        return f"{self.row}:{self.col} ({self.connected})"
+
+Matrix = list[list[Jack]]
 
 
-class Grid:
-    def __init__(self, draw=None, rows=4, cols=4, x=0, y=0, side_length=10):
-        """
-        Arguments:
-            draw: PIL.ImageDraw
-            rows: row count
-            cols: col count
-            x: offset x
-            y: offset y
-            side_length: side length
-        """
-        assert draw is not None
-        self.draw = draw
+@dataclass
+class Cursor:
+    row: int
+    col: int
+
+
+@dataclass
+class Model:
+    labels: list[str] = field(default_factory=list)
+    matrix: Matrix = field(default_factory=list)
+
+
+class View(Protocol):
+    def setup(self, controller: "Controller"):
+        ...
+
+    def update(self, model: Model):
+        ...
+
+
+class Controller(Protocol):
+    model: Model
+    view: View
+
+    def start(self):
+        self.view.setup(self)
+        thread = threading.Thread(target=self.update, daemon=True)
+        thread.start()
+        thread.join()
+
+    def update(self):
+        """Wait for MIDI events, and run updates"""
+        while True:
+            event = seq.event_input()
+
+            if event.type not in (
+                EventType.PORT_START,
+                EventType.PORT_EXIT,
+                EventType.PORT_SUBSCRIBED,
+                EventType.PORT_UNSUBSCRIBED,
+            ):
+                continue
+
+            self.update_midi_connections()
+            self.view.update(self.model)
+
+    def update_midi_connections(self):
+        ports = seq.list_ports(output=True, type=PortType.MIDI_GENERIC | PortType.HARDWARE)
+
+        self.model.labels = [port.client_name for port in ports]
+        self.model.matrix = []
+
+        for row, outport in enumerate(ports):
+            # Find inputs connected to the outport
+            input_ids = [
+                inport.addr.client_id for inport in seq.list_port_subscribers(outport, type=SubscriptionQueryType.READ)
+            ]
+
+            # Add jacks
+            self.model.matrix.append(
+                [Jack(row, col, outport, port, port.client_id in input_ids) for col, port in enumerate(ports)]
+            )
+
+
+@dataclass
+class SSD128x64View(View):
+    oled_address: str
+    oled_contrast: int = 128
+    enable_buttons: bool = False
+    gpio_button_left_port: int = 16
+    gpio_button_right_port: int = 26
+
+    def setup(self, controller: "OLEDController"):
+        self.controller = controller
+
+        if self.enable_buttons:
+            self.button_left = Button(self.gpio_button_left_port)
+            self.button_left.when_released = self.controller.move_cursor_left
+            self.button_left.when_held = self.controller.connect
+            self.button_right = Button(self.gpio_button_right_port)
+            self.button_right.when_released = self.controller.move_cursor_right
+            self.button_right.when_held = self.controller.connect
+
+        self.device = None
+        self.init_device()
+
+        self.grid = GridWidget(parent=self)
+        self.grid.align_right()
+
+    def init_device(self):
+        serial = i2c(port=1, address=int(self.oled_address, 16))
+        self.device = ssd1306(serial)
+        self.device.contrast(self.oled_contrast)
+
+    def update(self, model: Model):
+        with canvas(self.device) as draw:
+            # display labels
+            for idx, label in enumerate(model.labels):
+                draw.text((0, self.grid.ry(idx)), label[:12], fill="white", anchor="ar")
+
+            # display grid matrix
+            self.grid.display(draw, model.matrix)
+
+    def move_cursor(self, x: int, y: int):
+        self.grid.move_cursor(cols=x, rows=y)
+
+    def get_cursor(self):
+        return self.grid.cursor
+
+
+class OLEDController(Controller):
+    view: SSD128x64View
+
+    def __init__(self, model: Model, view: SSD128x64View):
+        self.model = model
+        self.view = view
+        self.connecting = False
+
+    def move_cursor(self, x: int = 1, y: int = 0):
+        if not self.connecting:
+            self.view.move_cursor(x, y)
+            self.view.update(self.model)
+        self.connecting = False
+
+    def move_cursor_left(self):
+        self.move_cursor(x=-1)
+
+    def move_cursor_right(self):
+        self.move_cursor(x=+1)
+
+    def connect(self):
+        self.connecting = True
+
+        cursor = self.view.get_cursor()
+        if cursor.row == cursor.col:
+            print("cannot connect to self")
+            return
+
+        try:
+            jack = self.model.matrix[cursor.row][cursor.col]
+            if not jack.connected:
+                print(f"connecting {jack.port_out} to {jack.port_in}")
+                seq.subscribe_port(jack.port_out, jack.port_in)
+            else:
+                print(f"disconnecting {jack.port_in} from {jack.port_out}")
+                seq.unsubscribe_port(jack.port_out, jack.port_in)
+        except IndexError:
+            print("no jacks to connect")
+
+
+class GridWidget:
+    ROWS = COLS = MAX_USB_PORTS
+    SIDE_LENGTH = 12
+
+    def __init__(self, parent=None, rows=ROWS, cols=COLS, x=0, y=0, side_length=SIDE_LENGTH):
+        self.parent = parent
         self.rows = rows
         self.cols = cols
         self._x = x
         self._y = y
         self.side_length = side_length
+        self.cursor = Cursor(row=0, col=0)
 
     def align_right(self):
-        self._x = device.width - self.width - 2
+        self._x = self.parent.device.width - self.width - 2
 
     def rx(self, x):
         return self._x + x * self.side_length
@@ -85,80 +222,47 @@ class Grid:
         for coords in self.generate_unit_squares(self.rows, self.cols):
             yield [(self.rx(x), self.ry(y)) for (x, y) in coords]
 
-    def display(self):
+    def display(self, draw: ImageDraw, matrix: Matrix):
+        # show grid
         for coords in self.generate_squares():
-            self.draw.polygon(coords, outline="white")
+            draw.polygon(coords, outline="white")
 
-    def mark(self, x, y):
-        self.draw.text((self.rx(x) + 4, self.ry(y)), "X", fill="white")
+        # show cursor
+        draw.text((self.rx(self.cursor.col) + 4, self.ry(self.cursor.row)), "_", fill="white")
 
-
-def get_midi_connections():
-    ports = seq.list_ports(output=True, type=PortType.MIDI_GENERIC | PortType.HARDWARE)
-
-    labels = [port.client_name for port in ports]
-    matrix = []
-
-    for row, outport in enumerate(ports):
-        # Find inputs connected to the outport
-        subscribers = [
-            subscriber.addr.client_id
-            for subscriber in seq.list_port_subscribers(outport, type=SubscriptionQueryType.WRITE)
-        ]
-
-        # Add jacks
-        matrix.append(
-            [
-                Jack(row, col, outport.client_name, port.client_name, port.client_id in subscribers)
-                for col, port in enumerate(ports)
-            ]
-        )
-
-    return labels, matrix
-
-
-def display():
-    """Get and display all MIDI connections"""
-
-    with canvas(device) as draw:
-        grid = Grid(draw=draw, rows=ROWS, cols=COLS, y=8, side_length=SIDE_LENGTH)
-        grid.align_right()
-        grid.display()
-
-        labels, matrix = get_midi_connections()
-
-        for idx, label in enumerate(labels):
-            draw.text((0, grid.ry(idx)), label[:12], fill="white", anchor="ar")
-
+        # mark jack connections
         for jacks in matrix:
             for jack in jacks:
                 if jack.connected:
-                    grid.mark(jack.row, jack.col)
+                    draw.text((self.rx(jack.col) + 4, self.ry(jack.row)), "X", fill="white")
 
+    def move_cursor(self, rows=0, cols=0):
+        col = self.cursor.col + cols
+        row = self.cursor.row + rows
+        self.cursor.col = col % self.cols
+        self.cursor.row = (row + col // self.cols) % self.rows
 
-def main():
-    display()
+def main(args):
+    model = Model()
 
-    while True:
-        event = seq.event_input()
+    view = SSD128x64View(
+        oled_address=args.oled_i2c_address,
+        oled_contrast=args.oled_contrast,
+        enable_buttons=args.enable_buttons,
+        gpio_button_left_port=args.gpio_button_left_port,
+        gpio_button_right_port=args.gpio_button_right_port,
+    )
 
-        if event.type not in (
-            EventType.PORT_START,
-            EventType.PORT_EXIT,
-            EventType.PORT_SUBSCRIBED,
-            EventType.PORT_UNSUBSCRIBED,
-        ):
-            continue
-
-        display()
-
-
-def shutdown(*args, **kwargs):
-    print("shutting down!")
-    device.cleanup()
-    sys.exit(0)
+    controller = OLEDController(model, view)
+    controller.start()
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, shutdown)
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--oled-i2c-address", default="0x3C")
+    parser.add_argument("--oled-contrast", type=int, default=128, help="OLED contrast (0-255)")
+    parser.add_argument("--enable-buttons", type=bool, action="store_true", help="Enable buttons")
+    parser.add_argument("--gpio-button-left-port", type=int, default=16)
+    parser.add_argument("--gpio-button-right-port", type=int, default=26)
+    args = parser.parse_args()
+    main(args)
