@@ -31,13 +31,23 @@ and it will open an editor, add this,
 
 ```
 [Service]
-Environment=OLED_I2C_ADDRESS=<your-address-here>
+ExecStart=/usr/bin/midimatrix --oled-i2c-address=03E
 ```
 save, and restart the service
 
 ```
 sudo systemctl daemon-reload
 sudo systemctl restart midimatrix
+```
+
+## Add input buttons (optional)
+You can wire a button to navigate, and make connections. Default pin is GPIO 26. Follow the steps above to customize the startup params. 
+
+Press to move forward, and hold to connect/disconnect ports.
+
+## Help
+```
+midimatrix --help
 ```
 
 ## Connect MIDI devices
